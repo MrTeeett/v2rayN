@@ -89,6 +89,10 @@ public class CoreManager
         }
 
         await CoreStart(mainContext);
+        if (preContext != null)
+        {
+            await WaitForProxyPort(_config.TunModeItem.EnableTun);
+        }
         await CoreStartPreService(preContext);
 
         AppManager.Instance.RunningCoreType = preContext?.RunCoreType ?? mainContext.RunCoreType;
@@ -210,6 +214,52 @@ public class CoreManager
     private async Task UpdateFunc(bool notify, string msg)
     {
         await _updateFunc?.Invoke(notify, msg);
+    }
+
+    // Wait until the main core's SOCKS5 proxy is fully initialized and ready to handle
+    // requests, so the pre-service (e.g. sing-box in TUN mode) can use it as
+    // download_detour for remote rule-sets. A TCP connect is not enough — Xray opens
+    // its listen socket before completing initialization, so we do a real SOCKS5 handshake.
+    private static async Task WaitForProxyPort(bool isTunEnabled, int timeoutMs = 5000)
+    {
+        if (!isTunEnabled)
+        {
+            return;
+        }
+
+        var port = AppManager.Instance.GetLocalPort(EInboundProtocol.socks);
+        if (port <= 0)
+        {
+            return;
+        }
+
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var tcp = new System.Net.Sockets.TcpClient();
+                await tcp.ConnectAsync(Global.Loopback, port);
+                var stream = tcp.GetStream();
+
+                // SOCKS5 client greeting: VER=5, NMETHODS=1, METHOD=0x00 (no auth)
+                await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+
+                var buf = new byte[2];
+                stream.ReadTimeout = 300;
+                var read = stream.Read(buf, 0, 2);
+
+                // Server selection: VER=5, METHOD=0x00 — proxy is fully ready
+                if (read == 2 && buf[0] == 0x05)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+                await Task.Delay(50);
+            }
+        }
     }
 
     #endregion Private
